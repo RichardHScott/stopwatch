@@ -71,11 +71,13 @@ void setup_segment_ctr(void) {
 }
 
 void inc_segment_ctr(void) {
+    SEGMENT_CTR_CLK = 0;
     SEGMENT_CTR_CLK = 1;
     SEGMENT_CTR_CLK = 0;
 }
 
 void reset_segment_ctr(void) {
+    SEGMENT_CTR_RESET = 0;
     SEGMENT_CTR_RESET = 1;
     SEGMENT_CTR_RESET = 0;
 }
@@ -83,7 +85,7 @@ void reset_segment_ctr(void) {
 inline static void setup_timer1(void) {
     // Setup timer
     T1CONbits.TMR1GE = 0; //not using the gate
-    T1CONbits.T1CKPS = 0b00; //pre-scalar
+    T1CONbits.T1CKPS = 0b10; //pre-scalar
     T1CONbits.T1OSCEN = 0;
     T1CONbits.nT1SYNC = 1;
     T1CONbits.TMR1CS = 0;
@@ -94,7 +96,6 @@ inline static void setup_timer1(void) {
     
     
     CCP1CONbits.CCP1M = 0b1010; // Compare mode with software interrupt
-    
     
     
 }
@@ -113,12 +114,25 @@ inline static void reset_timer1(void) {
 }
 
 void setup_interrupts(void) {
+    ANSEL = 0;
+    
     INTCONbits.GIE = 1;
     INTCONbits.PEIE = 1;
     
+    // Enable RA2 interrupt
+    OPTION_REGbits.INTEDG = 0;
+    INTF = 0;
+    INTCONbits.INTE = 1;
+    
+    // Enable porta interrupts
+    RAIF = 0;
+    INTCONbits.RAIE = 1;
+    
+    IOCA = 0b00100000;
+    
     // Clear the interrupt flag
     CCP1IF = 0;
-    // Enable the timer 1 intterupt
+    // Enable the timer 1 interupt
     PIE1bits.CCP1IE = 1;
 }
 
@@ -185,15 +199,43 @@ void compute_output(int count, unsigned char outputs[]) {
 }
 
 void output_counter(unsigned char outputs[]) {
-    for(signed char i=3; i>=0; --i) {
+    reset_segment_ctr();
+    //__delay_us(1);
+    for(char i=0; i<4; ++i) {
         write_byte_to_shift_register(outputs[i]);
+        write_byte_to_shift_register(0);
         inc_segment_ctr();
     }
+}
+
+static void setup_switch_inputs(void) {
+    TRISA2 = 1;
+    TRISA5 = 1;
+    
+    TRISC3 = 1;
+}
+
+void setup_debounce_timer(void) {
+    TMR0 = 0;
+    OPTION_REGbits.T0CS = 1;
+    OPTION_REGbits.PSA = 0;
+    OPTION_REGbits.PS = 0b111;
+    
+    INTCONbits.T0IF = 0;
+    INTCONbits.TMR0IE = 1;
+}
+
+#define CONTINUE_ON_STOP (PORTCbits.RC3)
+
+inline bool continue_on_stop(void) {
+    return CONTINUE_ON_STOP;
 }
 
 static volatile int counter = 0;
 const static int counter_max = 9999;
 static volatile bool counter_changed = false;
+
+static volatile unsigned char debounce = 0;
 
 void __interrupt() int_routine(void) {
     if (CCP1IF) {
@@ -213,6 +255,60 @@ void __interrupt() int_routine(void) {
         
         CCP1IF = 0;
     }
+    
+    if(RAIF) {
+        //a5 interrupt
+        unsigned char vals = PORTA;
+        // should we check here if the new val is 0 ?
+        // so that we only trigger when it goes high to prevent false triggering
+        
+        // manual reset
+        stop_timer1();
+        reset_timer1();
+        
+        counter = 0;
+        state = ARMED;
+        
+        counter_changed = true;
+       
+        RAIF = 0;
+    }
+    
+    if(INTF) {
+        //a2 interrupt
+        if(!debounce) {
+            if (state == ARMED) {
+                start_timer1();
+                state = TRIGGERED;
+                counter = 0;
+                counter_changed = true;
+            } else if (state == TRIGGERED) {
+                stop_timer1();
+                state = STOPPED;
+                counter_changed = true;
+            } else if (state == STOPPED) {
+                if (continue_on_stop()) {
+                    start_timer1();
+                    state = TRIGGERED;
+                    counter_changed = true;
+                }
+            }
+            
+            TMR0 = 0;
+            debounce = 1;
+            OPTION_REGbits.T0CS = 0;
+        }
+        INTF = 0;
+    }
+    
+    if (T0IF) {
+        if(++debounce == 5) {
+            debounce = 0;
+            OPTION_REGbits.T0CS = 1;
+            TMR0 = 0;
+        }
+        T0IF = 0;
+    }
 }
 
 void main(void) {
@@ -221,17 +317,21 @@ void main(void) {
     
     setup_timer1();
     
+    setup_switch_inputs();
+    
     setup_interrupts();
+    
+    setup_debounce_timer();
     
     reset_timer1();
     reset_segment_ctr();
     state = ARMED;
     
     unsigned char output_array[4] = {
-        default_counter_output[0],
-        default_counter_output[1],
-        default_counter_output[2],
-        default_counter_output[3]
+        0b11111100,
+        0b11111101,
+        0b11111100,
+        0b11111100
     };
     
     start();
